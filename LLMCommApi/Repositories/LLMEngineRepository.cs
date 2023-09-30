@@ -13,6 +13,7 @@ public class LLMEngineRepository : ILLMEngineRepository
     private readonly LLMCommSettings _commSettings;
     private IConnection _connection;
     private IModel _channel;
+    private EventingBasicConsumer _consumer;
     
     
     public LLMEngineRepository(IOptions<LLMCommSettings> commSettings)
@@ -37,14 +38,18 @@ public class LLMEngineRepository : ILLMEngineRepository
     public Task<PromptReply> PostPromptAsync(Prompt prompt)
     {
         var taskCompletionSource = new TaskCompletionSource<PromptReply>();
-
-        var queue = _commSettings.PromptQueue;
-        var consumer = ConsumeRabbitQueue(queue);
-        consumer.Received += (_, e) =>
+        var requestQueue = _commSettings.PromptQueue;
+        var replyQueue = _commSettings.LLMReplyQueue;
+        
+        if(!_connection.IsOpen) InitConnection();
+        _channel.QueueDeclare(queue: replyQueue, durable: false, exclusive: false, autoDelete: false, arguments: null);
+        
+        // listens to reply
+        _consumer = new EventingBasicConsumer(_channel);
+        _consumer.Received += (_, e) =>
         {
-            var body = e.Body.ToArray();
-            var reply = Encoding.UTF8.GetString(body);
-            Console.WriteLine($"Received: {reply}");
+            var reply = Encoding.UTF8.GetString(e.Body.ToArray());
+            Console.WriteLine($"received from {replyQueue}: {reply}");
             
             var promptReply = new PromptReply
             {
@@ -52,21 +57,19 @@ public class LLMEngineRepository : ILLMEngineRepository
                 CreatedDate = DateTimeOffset.Now
             };
             
-            _channel.BasicAck(deliveryTag: e.DeliveryTag, multiple: false);
             Dispose();
-            
             taskCompletionSource.SetResult(promptReply);
         };
+        _channel.BasicConsume(
+            queue: replyQueue,
+            autoAck: true,
+            consumer: _consumer
+        );
+        Console.WriteLine($"consumer started for {replyQueue}");
         
-        _channel.BasicConsume(queue: queue,
-            autoAck: false,
-            consumer: consumer);
-        Console.WriteLine("Consumer started");
+        // send request
+        SendMessage(prompt.PromptText, requestQueue, replyQueue);
         
-        // todo may need to implement timeout to avoid infinite waiting
-        Thread.Sleep(1000);
-        SendRabbitMessage(prompt.PromptText, queue);
-
         return taskCompletionSource.Task;
     }
 
@@ -77,41 +80,18 @@ public class LLMEngineRepository : ILLMEngineRepository
     }
 
 
-    private void SendRabbitMessage(string message, string queue)
+    private void SendMessage(string prompt, string requestQueue, string replyQueue)
     {
-        if(!_connection.IsOpen) InitConnection();
-        
-        Console.WriteLine("SendPromptToLlm");
-        
-        // no need to declare queue cause it is already declared when listening
-        
-        var body = Encoding.UTF8.GetBytes(message);
-
-        _channel.BasicPublish(exchange: string.Empty,
-            routingKey: queue,
-            basicProperties: null,
-            body: body);
-        
-        Console.WriteLine($"Sent {message}");
-    }
-
-
-    private EventingBasicConsumer ConsumeRabbitQueue(string queue)
-    {
-        if(!_connection.IsOpen) InitConnection();
-        
-        Console.WriteLine("ListenFromLlmReply");
-        
-        _channel.QueueDeclare(queue: queue,
-            durable: false,
-            exclusive: false,
-            autoDelete: false,
-            arguments: null);
-        
-        Console.WriteLine("Waiting for messages.");
-        
-        var consumer = new EventingBasicConsumer(_channel);
-        return consumer;
+        var messageBytes = Encoding.UTF8.GetBytes(prompt);
+        var props = _channel.CreateBasicProperties();
+        props.ReplyTo = replyQueue;
+        _channel.BasicPublish(
+            exchange: "",
+            routingKey: requestQueue,
+            basicProperties: props,
+            body: messageBytes
+        );
+        Console.WriteLine($"publish message to {requestQueue}");
     }
     
     
