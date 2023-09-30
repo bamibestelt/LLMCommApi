@@ -11,36 +11,63 @@ public class LLMEngineRepository : ILLMEngineRepository
 {
     
     private readonly LLMCommSettings _commSettings;
+    private IConnection _connection;
+    private IModel _channel;
     
     
     public LLMEngineRepository(IOptions<LLMCommSettings> commSettings)
     {
         _commSettings = commSettings.Value;
+        InitConnection();
     }
+
     
-    
+    private void InitConnection()
+    {
+        Console.WriteLine("InitConnection");
+        
+        var factory = new ConnectionFactory { HostName = _commSettings.Host };
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        
+        Console.WriteLine("connection initialized");
+    }
+
+
     public Task<PromptReply> PostPromptAsync(Prompt prompt)
     {
-        SendPromptToLLM(prompt);
-        
-        var tcs = new TaskCompletionSource<PromptReply>();
-        var consumer = ListenFromLLMReply();
-        consumer.Received += (model, ea) =>
-        {
-            var body = ea.Body.ToArray();
-            var reply = Encoding.UTF8.GetString(body);
-            Console.WriteLine($"Received {reply}");
+        var taskCompletionSource = new TaskCompletionSource<PromptReply>();
 
-            PromptReply promptReply = new()
+        var queue = _commSettings.PromptQueue;
+        var consumer = ConsumeRabbitQueue(queue);
+        consumer.Received += (_, e) =>
+        {
+            var body = e.Body.ToArray();
+            var reply = Encoding.UTF8.GetString(body);
+            Console.WriteLine($"Received: {reply}");
+            
+            var promptReply = new PromptReply
             {
                 Reply = reply,
-                CreatedDate = DateTimeOffset.UtcNow
+                CreatedDate = DateTimeOffset.Now
             };
             
-            tcs.SetResult(promptReply);
+            _channel.BasicAck(deliveryTag: e.DeliveryTag, multiple: false);
+            Dispose();
+            
+            taskCompletionSource.SetResult(promptReply);
         };
         
-        return tcs.Task;
+        _channel.BasicConsume(queue: queue,
+            autoAck: false,
+            consumer: consumer);
+        Console.WriteLine("Consumer started");
+        
+        // todo may need to implement timeout to avoid infinite waiting
+        Thread.Sleep(1000);
+        SendRabbitMessage(prompt.PromptText, queue);
+
+        return taskCompletionSource.Task;
     }
 
     
@@ -50,49 +77,50 @@ public class LLMEngineRepository : ILLMEngineRepository
     }
 
 
-    private void SendPromptToLLM(Prompt prompt)
+    private void SendRabbitMessage(string message, string queue)
     {
-        var factory = new ConnectionFactory { HostName = _commSettings.Host };
-        using var connection = factory.CreateConnection();
-        using var channel = connection.CreateModel();
+        if(!_connection.IsOpen) InitConnection();
         
-        channel.QueueDeclare(queue: _commSettings.PromptQueue,
-            durable: false,
-            exclusive: false,
-            autoDelete: false,
-            arguments: null);
+        Console.WriteLine("SendPromptToLlm");
         
-        var body = Encoding.UTF8.GetBytes(prompt.PromptText);
+        // no need to declare queue cause it is already declared when listening
+        
+        var body = Encoding.UTF8.GetBytes(message);
 
-        channel.BasicPublish(exchange: string.Empty,
-            routingKey: _commSettings.PromptQueue,
+        _channel.BasicPublish(exchange: string.Empty,
+            routingKey: queue,
             basicProperties: null,
             body: body);
         
-        Console.WriteLine($"Sent {prompt.PromptText}");
+        Console.WriteLine($"Sent {message}");
     }
 
 
-    private EventingBasicConsumer ListenFromLLMReply()
+    private EventingBasicConsumer ConsumeRabbitQueue(string queue)
     {
-        var factory = new ConnectionFactory { HostName = _commSettings.Host };
-        using var connection = factory.CreateConnection();
-        using var channel = connection.CreateModel();
+        if(!_connection.IsOpen) InitConnection();
         
-        channel.QueueDeclare(queue: _commSettings.PromptQueue,
+        Console.WriteLine("ListenFromLlmReply");
+        
+        _channel.QueueDeclare(queue: queue,
             durable: false,
             exclusive: false,
             autoDelete: false,
             arguments: null);
         
         Console.WriteLine("Waiting for messages.");
-
-        // consume channel
-        var consumer = new EventingBasicConsumer(channel);
-        channel.BasicConsume(queue: _commSettings.PromptQueue,
-            autoAck: true,
-            consumer: consumer);
         
+        var consumer = new EventingBasicConsumer(_channel);
         return consumer;
     }
+    
+    
+    private void Dispose()
+    {
+        _channel.Dispose();
+        _connection.Dispose();
+    }
+    
+    
 }
+
