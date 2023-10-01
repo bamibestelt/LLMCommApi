@@ -49,6 +49,7 @@ public class LLMEngineController : ControllerBase
     {
         _logger.LogInformation("RequestDataUpdateAsync");
         
+        // todo ping-pong from and until certain status
         var status = await _repository.RequestDataUpdateAsync();
         Console.WriteLine($"status: {status.Status}");
         

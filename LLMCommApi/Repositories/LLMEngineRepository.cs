@@ -76,7 +76,39 @@ public class LLMEngineRepository : ILLMEngineRepository
     
     public Task<DataUpdateStatus> RequestDataUpdateAsync()
     {
-        throw new NotImplementedException();
+        var taskCompletionSource = new TaskCompletionSource<DataUpdateStatus>();
+        var requestQueue = _commSettings.LLMUpdateQueue;
+        var replyQueue = _commSettings.LLMStatusQueue;
+        
+        if(!_connection.IsOpen) InitConnection();
+        _channel.QueueDeclare(queue: replyQueue, durable: false, exclusive: false, autoDelete: false, arguments: null);
+        
+        // listens to reply
+        _consumer = new EventingBasicConsumer(_channel);
+        _consumer.Received += (_, e) =>
+        {
+            var status = Encoding.UTF8.GetString(e.Body.ToArray());
+            Console.WriteLine($"received from {replyQueue}: {status}");
+            
+            var dataUpdateStatus = new DataUpdateStatus
+            {
+                Status = status,
+                CreatedDate = DateTimeOffset.Now
+            };
+            
+            Dispose();
+            taskCompletionSource.SetResult(dataUpdateStatus);
+        };
+        _channel.BasicConsume(
+            queue: replyQueue,
+            autoAck: true,
+            consumer: _consumer
+        );
+        Console.WriteLine($"consumer started for {replyQueue}");
+        
+        SendMessage("all-data-source-param", requestQueue, replyQueue);
+        
+        return taskCompletionSource.Task;
     }
 
 
