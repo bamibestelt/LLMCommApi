@@ -2,6 +2,10 @@ using LLMCommApi.Repositories;
 using LLMCommApi.Settings;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(builder => builder.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
+});
 builder.Services.Configure<LLMCommSettings>(builder.Configuration.GetSection("RabbitMQ"));
 
 // Add services to the container.
@@ -20,6 +24,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+app.UseCors();
 
 app.UseHttpsRedirection();
 
